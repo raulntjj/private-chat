@@ -374,6 +374,10 @@ int main(int argc, char *argv[]) {
 
     setenv("TZ", "America/Sao_Paulo", 1);
     tzset();
+    
+    // Configurar horário de Brasília (UTC-3)
+    putenv("TZ=UTC-3");
+    tzset();
 
     if (argc < 3) {
         fprintf(stderr, "Uso: %s <ip_servidor> <porta>\n", argv[0]);
