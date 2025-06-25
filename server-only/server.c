@@ -16,21 +16,39 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>      // Para a função close() e write()
-#include <pthread.h>     // Para threads
-#include <sys/socket.h>  // Para a API de Sockets
-#include <arpa/inet.h>   // Para estruturas de endereço
-#include <time.h>        // Para timestamps
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <time.h>
 
-#define BUFFER_SIZE 1024 // Tamanho do buffer de mensagens
+#define BUFFER_SIZE 1024
 #define NICKNAME_MAX 50
 
 // Variável global para sinalizar o fim da conexão para as threads
-volatile int CONNECTION_ENDED = 0;
+volatile int FIM_CONEXAO = 0;
+volatile int MENSAGEM_RECEBIDA = 0;
+
+// Estrutura para armazenar a mensagem recebida
+typedef struct {
+    char mensagem[BUFFER_SIZE];
+    int tamanho;
+} MensagemRecebida;
+
+MensagemRecebida ultima_mensagem;
+pthread_mutex_t mutex_mensagem = PTHREAD_MUTEX_INITIALIZER;
+
+// Variáveis globais para gerenciar o input atual
+char input_atual[BUFFER_SIZE] = "";
+int posicao_atual = 0;
+int input_visivel = 0; // Flag para indicar se há input visível na tela
 
 // Variáveis globais para nicknames
-char server_nickname[NICKNAME_MAX] = "Servidor";
-char client_nickname[NICKNAME_MAX] = "Cliente";
+char nickname[NICKNAME_MAX] = "Servidor";
+char nickname_parceiro[NICKNAME_MAX] = "Cliente";
 
 // Função para obter timestamp atual
 char* obter_timestamp() {
@@ -39,6 +57,36 @@ char* obter_timestamp() {
     struct tm *t = localtime(&now);
     strftime(timestamp, sizeof(timestamp), "%H:%M", t);
     return timestamp;
+}
+
+// Função para limpar linha atual
+void limpar_linha_atual() {
+    printf("\r\033[K"); // Volta ao início da linha e limpa
+    fflush(stdout);
+}
+
+// Função para configurar entrada não-bloqueante
+void configurar_entrada_nao_bloqueante() {
+    struct termios term;
+    tcgetattr(STDIN_FILENO, &term);
+    term.c_lflag &= ~(ICANON | ECHO);
+    term.c_cc[VMIN] = 0;
+    term.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &term);
+    
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Função para restaurar configurações do terminal
+void restaurar_terminal() {
+    struct termios term;
+    tcgetattr(STDIN_FILENO, &term);
+    term.c_lflag |= (ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &term);
+    
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
 }
 
 // Função para processar comandos do servidor
@@ -63,8 +111,8 @@ int processar_comando_servidor(char *mensagem) {
         printf("\n\033[34m══════════════════════════════════════════════════════════════\033[0m\n");
         printf("\033[34m                           SEU STATUS                         \033[0m\n");
         printf("\033[34m══════════════════════════════════════════════════════════════\033[0m\n");
-        printf("\033[32m✓ Nickname: %s\033[0m\n", server_nickname);
-        printf("\033[32m✓ Cliente: %s\033[0m\n", client_nickname);
+        printf("\033[32m✓ Nickname: %s\033[0m\n", nickname);
+        printf("\033[32m✓ Parceiro: %s\033[0m\n", nickname_parceiro);
         printf("\033[34m══════════════════════════════════════════════════════════════\033[0m\n\n");
         return 2; // Sinalizar que é comando interno (não enviar)
     }
@@ -73,52 +121,132 @@ int processar_comando_servidor(char *mensagem) {
 }
 
 // Função executada pela thread de recebimento de mensagens
-void *receive_messages_handler(void *socket_descriptor) {
-    int client_socket = *(int*)socket_descriptor;
-    char peer_message[BUFFER_SIZE];
-    int bytes_read;
+void *receber_mensagens(void *socket_desc) {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    int sock = *(int*)socket_desc;
+    char server_message[BUFFER_SIZE];
+    int read_size;
 
-    // Loop para receber mensagens do cliente
-    while ((bytes_read = recv(client_socket, peer_message, BUFFER_SIZE, 0)) > 0) {
-        peer_message[bytes_read] = '\0'; // Adiciona terminador de string
+    while ((read_size = recv(sock, server_message, BUFFER_SIZE, 0)) > 0) {
+        server_message[read_size] = '\0';
         
         // Verificar se é um comando /nick do cliente
         char cmd[BUFFER_SIZE];
         char arg1[BUFFER_SIZE];
-        if (sscanf(peer_message, "%s %s", cmd, arg1) >= 1) {
+        if (sscanf(server_message, "%s %s", cmd, arg1) >= 1) {
             if (strcmp(cmd, "/nick") == 0 && strlen(arg1) > 0) {
-                strncpy(client_nickname, arg1, NICKNAME_MAX - 1);
-                client_nickname[NICKNAME_MAX - 1] = '\0';
-                printf("\033[33m[SISTEMA] %s alterou o nickname para: %s\033[0m\n", client_nickname, arg1);
-                printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-                fflush(stdout);
+                strncpy(nickname_parceiro, arg1, NICKNAME_MAX - 1);
+                nickname_parceiro[NICKNAME_MAX - 1] = '\0';
+                pthread_mutex_lock(&mutex_mensagem);
+                strcpy(ultima_mensagem.mensagem, server_message);
+                ultima_mensagem.tamanho = read_size;
+                MENSAGEM_RECEBIDA = 1;
+                pthread_mutex_unlock(&mutex_mensagem);
                 continue;
             }
         }
         
-        // Exibir mensagem normal do cliente
-        printf("\033[32m[%s] %s: %s\033[0m", obter_timestamp(), client_nickname, peer_message);
-        if (peer_message[strlen(peer_message) - 1] != '\n') {
-            printf("\n");
-        }
-        printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-        fflush(stdout);
-
-        // Verifica se a mensagem é o comando para encerrar
-        if (strncmp(peer_message, "/quit", 5) == 0) {
+        pthread_mutex_lock(&mutex_mensagem);
+        strcpy(ultima_mensagem.mensagem, server_message);
+        ultima_mensagem.tamanho = read_size;
+        MENSAGEM_RECEBIDA = 1;
+        pthread_mutex_unlock(&mutex_mensagem);
+        if (strncmp(server_message, "/quit", 5) == 0) {
             break;
         }
     }
-
-    // Se o loop terminar, a conexão foi perdida ou encerrada
-    if (bytes_read == 0) {
-        printf("\n\033[33m[SISTEMA] Cliente desconectou.\033[0m\n");
-    } else if (bytes_read == -1) {
+    if (read_size == 0) {
+        printf("\n\033[33m[SISTEMA] Parceiro desconectou.\033[0m\n");
+    } else if (read_size == -1) {
         perror("[ERRO] Falha ao receber mensagem");
     }
-
-    CONNECTION_ENDED = 1; // Sinaliza para a thread principal encerrar
+    FIM_CONEXAO = 1;
     return 0;
+}
+
+// Função para ler entrada do usuário de forma não-bloqueante
+int ler_entrada_usuario(char *buffer, int max_size) {
+    char c;
+    int bytes_read = read(STDIN_FILENO, &c, 1);
+    
+    if (bytes_read <= 0) {
+        return 0; // Nenhum caractere disponível
+    }
+    
+    if (c == '\n' || c == '\r') {
+        // Enter pressionado - finalizar mensagem
+        if (posicao_atual > 0) {
+            input_atual[posicao_atual] = '\0';
+            strcpy(buffer, input_atual);
+            posicao_atual = 0;
+            input_atual[0] = '\0';
+            input_visivel = 0;
+            return 1; // Mensagem completa
+        }
+    } else if (c == 127 || c == 8) {
+        // Backspace - só permite apagar se não estiver no início do prompt
+        if (posicao_atual > 0) {
+            posicao_atual--;
+            input_atual[posicao_atual] = '\0';
+            printf("\b \b"); // Apagar caractere na tela
+            fflush(stdout);
+        }
+        // Se tentar apagar além do prompt, não faz nada (protege o prompt)
+    } else if (posicao_atual < max_size - 1) {
+        // Adicionar caractere ao buffer
+        input_atual[posicao_atual] = c;
+        posicao_atual++;
+        input_atual[posicao_atual] = '\0';
+        printf("%c", c); // Mostrar caractere na tela
+        fflush(stdout);
+    }
+    
+    return 0; // Mensagem ainda não completa
+}
+
+// Função para exibir prompt de entrada
+void exibir_prompt() {
+    printf("\033[36m[%s] %s(você): \033[0m", obter_timestamp(), nickname);
+    fflush(stdout);
+}
+
+// Função para exibir mensagem recebida
+void exibir_mensagem_recebida(const char *mensagem) {
+    // Limpa a linha atual do input
+    limpar_linha_atual();
+
+    // Verificar se é um comando /nick
+    char cmd[BUFFER_SIZE];
+    char arg1[BUFFER_SIZE];
+    if (sscanf(mensagem, "%s %s", cmd, arg1) >= 1) {
+        if (strcmp(cmd, "/nick") == 0 && strlen(arg1) > 0) {
+            // Mostrar mensagem de confirmação do nickname do parceiro
+            printf("\033[33m[SISTEMA] %s alterou o nickname para: %s\033[0m\n", nickname_parceiro, arg1);
+        } else {
+            // Exibe a mensagem recebida normal
+            printf("\033[32m[%s] %s: %s\033[0m", obter_timestamp(), nickname_parceiro, mensagem);
+            if (mensagem[strlen(mensagem) - 1] != '\n') {
+                printf("\n");
+            }
+        }
+    } else {
+        // Exibe a mensagem recebida normal
+        printf("\033[32m[%s] %s: %s\033[0m", obter_timestamp(), nickname_parceiro, mensagem);
+        if (mensagem[strlen(mensagem) - 1] != '\n') {
+            printf("\n");
+        }
+    }
+
+    // Sempre reimprime o prompt e o input atual (se houver)
+    printf("\033[36m[%s] %s(você): \033[0m%s", obter_timestamp(), nickname, input_atual);
+    fflush(stdout);
+}
+
+// Função para exibir mensagem enviada
+void exibir_mensagem_enviada(const char *mensagem) {
+    limpar_linha_atual();
+    printf("\033[34m[%s] %s(você): %s\033[0m\n", obter_timestamp(), nickname, mensagem);
+    exibir_prompt();
 }
 
 int main(int argc, char *argv[]) {
@@ -131,6 +259,9 @@ int main(int argc, char *argv[]) {
     int server_socket, client_socket;
     struct sockaddr_in server_address, client_address;
     pthread_t receive_thread;
+
+    setenv("TZ", "America/Sao_Paulo", 1);
+    tzset();
 
     // 1. Criar o socket do servidor
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -157,7 +288,7 @@ int main(int argc, char *argv[]) {
     printf("\033[32m══════════════════════════════════════════════════════════════\033[0m\n");
     printf("\033[32m                    CHAT PRIVADO - SERVIDOR                    \033[0m\n");
     printf("\033[32m              Aguardando conexão na porta %d              \033[0m\n", port);
-    printf("\033[32m              Nickname: %s%-*s              \033[0m\n", server_nickname, 30 - strlen(server_nickname), "");
+    printf("\033[32m              Nickname: %s%-*s              \033[0m\n", nickname, 30 - strlen(nickname), "");
     printf("\033[32m                                                              \033[0m\n");
     printf("\033[32m  Digite '/quit' para sair                                    \033[0m\n");
     printf("\033[32m══════════════════════════════════════════════════════════════\033[0m\n\n");
@@ -177,84 +308,99 @@ int main(int argc, char *argv[]) {
     printf("\033[32m[SISTEMA] Conexão aceita de %s. Pode começar a conversar.\033[0m\n", peer_ip);
     printf("\033[32m[SISTEMA] Digite '/quit' para encerrar a conversa.\033[0m\n\n");
 
+    configurar_entrada_nao_bloqueante();
+
     // 5. Criar a thread para receber mensagens
-    if (pthread_create(&receive_thread, NULL, receive_messages_handler, (void*)&client_socket) < 0) {
+    if (pthread_create(&receive_thread, NULL, receber_mensagens, (void*)&client_socket) < 0) {
         perror("[ERRO] Não foi possível criar a thread de recebimento");
         close(client_socket);
         close(server_socket);
+        restaurar_terminal();
         return 1;
     }
 
     // 6. Loop principal para enviar mensagens
     char message[BUFFER_SIZE];
-    printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-    fflush(stdout);
+    exibir_prompt();
     
-    while (!CONNECTION_ENDED) {
-        if (fgets(message, BUFFER_SIZE, stdin) != NULL) {
+    while (!FIM_CONEXAO) {
+        if (MENSAGEM_RECEBIDA) {
+            pthread_mutex_lock(&mutex_mensagem);
+            exibir_mensagem_recebida(ultima_mensagem.mensagem);
+            MENSAGEM_RECEBIDA = 0;
+            pthread_mutex_unlock(&mutex_mensagem);
+        }
+        if (ler_entrada_usuario(message, BUFFER_SIZE)) {
+            // Remove espaços em branco do início e fim
+            char *msg_trim = message;
+            while (*msg_trim == ' ' || *msg_trim == '\t') msg_trim++;
+            size_t len = strlen(msg_trim);
+            while (len > 0 && (msg_trim[len-1] == ' ' || msg_trim[len-1] == '\t' || msg_trim[len-1] == '\n')) {
+                msg_trim[--len] = '\0';
+            }
+            
             // Verificar se é comando /nick
             char cmd[BUFFER_SIZE];
             char arg1[BUFFER_SIZE];
-            if (sscanf(message, "%s %s", cmd, arg1) >= 1) {
+            if (sscanf(msg_trim, "%s %s", cmd, arg1) >= 1) {
                 if (strcmp(cmd, "/nick") == 0) {
                     if (strlen(arg1) > 0) {
                         // Atualizar nickname local
-                        strncpy(server_nickname, arg1, NICKNAME_MAX - 1);
-                        server_nickname[NICKNAME_MAX - 1] = '\0';
+                        strncpy(nickname, arg1, NICKNAME_MAX - 1);
+                        nickname[NICKNAME_MAX - 1] = '\0';
                         // Enviar para o cliente
-                        if (send(client_socket, message, strlen(message), 0) < 0) {
+                        if (send(client_socket, msg_trim, strlen(msg_trim), 0) < 0) {
                             perror("[ERRO] Falha ao enviar mensagem");
-                            CONNECTION_ENDED = 1;
+                            FIM_CONEXAO = 1;
                         } else {
-                            printf("\033[32m✓ Nickname alterado para: %s\033[0m\n", server_nickname);
-                            printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-                            fflush(stdout);
+                            limpar_linha_atual();
+                            printf("\033[32m✓ Nickname alterado para: %s\033[0m\n", nickname);
+                            exibir_prompt();
                         }
                         continue;
                     } else {
+                        limpar_linha_atual();
                         printf("\033[31m✗ Uso: /nick <nome>\033[0m\n");
-                        printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-                        fflush(stdout);
+                        exibir_prompt();
                         continue;
                     }
                 }
             }
             
-            // Processar outros comandos
-            int resultado_comando = processar_comando_servidor(message);
-            if (resultado_comando == 1) {
-                // Enviar /quit para o cliente antes de sair
-                send(client_socket, "/quit\n", 6, 0);
-                CONNECTION_ENDED = 1;
-                break;
-            } else if (resultado_comando == 2) {
-                printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-                fflush(stdout);
-                continue;
-            }
-
-            // Enviar mensagem normal para o cliente
-            if (send(client_socket, message, strlen(message), 0) < 0) {
-                perror("[ERRO] Falha ao enviar mensagem");
-                CONNECTION_ENDED = 1;
-            } else {
-                // Exibir mensagem enviada
-                printf("\033[34m[%s] %s(você): %s\033[0m", obter_timestamp(), server_nickname, message);
-                if (message[strlen(message) - 1] != '\n') {
-                    printf("\n");
+            // Se for comando, processa normalmente
+            if (msg_trim[0] == '/' && strlen(msg_trim) > 0) {
+                int resultado_comando = processar_comando_servidor(msg_trim);
+                if (resultado_comando == 1) {
+                    // Enviar /quit para o cliente antes de sair
+                    send(client_socket, "/quit\n", 6, 0);
+                    FIM_CONEXAO = 1;
+                    break;
+                } else if (resultado_comando == 2) {
+                    exibir_prompt();
                 }
-                printf("[%s] %s(você): ", obter_timestamp(), server_nickname);
-                fflush(stdout);
+            }
+            // Só envia/exibe se não for vazio
+            else if (strlen(msg_trim) > 0) {
+                if (send(client_socket, msg_trim, strlen(msg_trim), 0) < 0) {
+                    perror("[ERRO] Falha ao enviar mensagem");
+                    FIM_CONEXAO = 1;
+                } else {
+                    exibir_mensagem_enviada(msg_trim);
+                }
+            } else {
+                exibir_prompt();
             }
         }
+        usleep(10000);
     }
 
     // Espera a thread de recebimento finalizar
+    pthread_cancel(receive_thread);
     pthread_join(receive_thread, NULL);
 
     printf("\n\033[33m[SISTEMA] Encerrando a conexão.\033[0m\n");
     close(client_socket);
     close(server_socket);
-
-    return 0;
+    restaurar_terminal();
+    exit(0);
 }
