@@ -292,7 +292,7 @@ int main(int argc, char *argv[]) {
     printf("\033[32m══════════════════════════════════════════════════════════════\033[0m\n");
     printf("\033[32m                    CHAT PRIVADO - SERVIDOR                    \033[0m\n");
     printf("\033[32m              Aguardando conexão na porta %d              \033[0m\n", port);
-    printf("\033[32m              Nickname: %s%-*s              \033[0m\n", nickname, 30 - strlen(nickname), "");
+    printf("\033[32m              Nickname: %s%-*s              \033[0m\n", nickname, (int)(strlen(nickname)), "");
     printf("\033[32m                                                              \033[0m\n");
     printf("\033[32m  Digite '/quit' para sair                                    \033[0m\n");
     printf("\033[32m══════════════════════════════════════════════════════════════\033[0m\n\n");
