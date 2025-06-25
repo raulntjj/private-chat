@@ -1,7 +1,7 @@
 services:
   server:
     build: .
-    container_name: chat-server-only
+    container_name: chat-host
     ports:
       - "${PORT:-8080}:8080"
     stdin_open: true

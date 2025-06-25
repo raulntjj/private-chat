@@ -1,7 +1,7 @@
 services:
   client:
     build: .
-    container_name: chat-client-only
+    container_name: chat-client
     command: ./client ${HOST} ${PORT:-8080}
     stdin_open: true
     tty: true
