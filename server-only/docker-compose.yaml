@@ -1,0 +1,16 @@
+services:
+  server:
+    build: .
+    container_name: chat-server
+    network_mode: "host"
+    command: ./server ${PORT:-8080}
+    stdin_open: true
+    tty: true
+
+  # client:
+  #   build: .
+  #   container_name: chat-client
+  #   network_mode: "host"
+  #   command: sh -c "sleep 2 && ./client ${HOST:-127.0.0.1} ${PORT:-8080}"
+  #   stdin_open: true
+  #   tty: true
